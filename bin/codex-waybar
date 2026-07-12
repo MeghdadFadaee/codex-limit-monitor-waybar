@@ -82,30 +82,33 @@ def fetch_rate_limits(timeout: float, codex_command: str = "codex") -> dict[str,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
         assert process.stdin is not None
         assert process.stdout is not None
-        process.stdin.write(payload)
+        process.stdin.write(payload.encode())
         process.stdin.flush()
 
         deadline = time.monotonic() + timeout
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
+        buffered = b""
         while time.monotonic() < deadline:
             events = selector.select(deadline - time.monotonic())
             if not events:
                 break
-            line = process.stdout.readline()
-            if not line:
+            chunk = os.read(process.stdout.fileno(), 65_536)
+            if not chunk:
                 break
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if message.get("id") == 2:
-                return parse_json_lines(line)
+            buffered += chunk
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if message.get("id") == 2:
+                    return parse_json_lines(line.decode())
         raise UsageError("Codex app-server timed out or returned no rate-limit data")
     except FileNotFoundError as exc:
         raise UsageError(f"{codex_command!r} was not found") from exc
@@ -123,6 +126,9 @@ def fetch_rate_limits(timeout: float, codex_command: str = "codex") -> dict[str,
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
 
 
 def select_snapshot(result: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +146,7 @@ def select_snapshot(result: dict[str, Any]) -> dict[str, Any]:
     raise UsageError("No Codex rate-limit snapshot is available")
 
 
-def select_windows(snapshot: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def select_windows(snapshot: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     windows = [
         window
         for key in ("primary", "secondary")
@@ -149,8 +155,8 @@ def select_windows(snapshot: dict[str, Any]) -> tuple[dict[str, Any], dict[str, 
     by_duration = {window.get("windowDurationMins"): window for window in windows}
     five_hour = by_duration.get(FIVE_HOUR_MINS)
     weekly = by_duration.get(WEEKLY_MINS)
-    if not isinstance(five_hour, dict) or not isinstance(weekly, dict):
-        raise UsageError("The 5-hour or weekly Codex limit window is unavailable")
+    if not isinstance(five_hour, dict) and not isinstance(weekly, dict):
+        raise UsageError("Codex returned no supported rate-limit windows")
     return five_hour, weekly
 
 
@@ -210,18 +216,29 @@ def validate_template(template: str) -> None:
 
 def format_values(snapshot: dict[str, Any], now: int) -> tuple[dict[str, Any], int]:
     five_hour, weekly = select_windows(snapshot)
-    five_used = int(five_hour.get("usedPercent", 0))
-    weekly_used = int(weekly.get("usedPercent", 0))
+
+    def window_values(window: dict[str, Any] | None) -> tuple[int | str, str, str]:
+        if window is None:
+            return "n/a", "n/a", "n/a"
+        return (
+            int(window.get("usedPercent", 0)),
+            human_countdown(window.get("resetsAt"), now),
+            reset_time(window.get("resetsAt")),
+        )
+
+    five_used, five_reset_in, five_reset_at = window_values(five_hour)
+    weekly_used, weekly_reset_in, weekly_reset_at = window_values(weekly)
     values = {
         "five_hour_used": five_used,
         "weekly_used": weekly_used,
-        "five_hour_reset_in": human_countdown(five_hour.get("resetsAt"), now),
-        "weekly_reset_in": human_countdown(weekly.get("resetsAt"), now),
-        "five_hour_reset_at": reset_time(five_hour.get("resetsAt")),
-        "weekly_reset_at": reset_time(weekly.get("resetsAt")),
+        "five_hour_reset_in": five_reset_in,
+        "weekly_reset_in": weekly_reset_in,
+        "five_hour_reset_at": five_reset_at,
+        "weekly_reset_at": weekly_reset_at,
         "plan": snapshot.get("planType") or "unknown",
     }
-    return values, max(five_used, weekly_used)
+    percentages = [value for value in (five_used, weekly_used) if isinstance(value, int)]
+    return values, max(percentages, default=0)
 
 
 def output_json(
@@ -265,7 +282,9 @@ def terminal_color(text: str, code: str, color: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-def terminal_bar(used: int, color: str) -> str:
+def terminal_bar(used: int | str, color: str) -> str:
+    if not isinstance(used, int):
+        return "░" * TERMINAL_BAR_WIDTH
     filled = round(max(0, min(100, used)) * TERMINAL_BAR_WIDTH / 100)
     bar = "█" * filled + "░" * (TERMINAL_BAR_WIDTH - filled)
     code = "31" if used >= 90 else "33" if used >= 70 else "36"
@@ -285,8 +304,9 @@ def terminal_output(
     values, percentage = format_values(snapshot, now or int(time.time()))
     state = "CRITICAL" if percentage >= critical else "WARNING" if percentage >= warning else "OK"
     state_code = "31" if state == "CRITICAL" else "33" if state == "WARNING" else "32"
-    def row(label: str, used: int, reset_in: str) -> str:
-        suffix = f"  {used:>3}% used  · resets in {reset_in}"
+    def row(label: str, used: int | str, reset_in: str) -> str:
+        usage = f"{used:>3}% used" if isinstance(used, int) else f"{used:>8}"
+        suffix = f"  {usage}  · resets in {reset_in}"
         padding = TERMINAL_WIDTH - 36 - len(suffix)
         return f"│  {label:<7} {terminal_bar(used, color)}{suffix}{' ' * max(0, padding)}│"
 

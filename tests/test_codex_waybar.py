@@ -3,6 +3,7 @@ from importlib.machinery import SourceFileLoader
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,30 @@ def rate_result(five_used=22, weekly_used=18):
 
 
 class UsageModuleTests(unittest.TestCase):
+    def test_fetch_handles_multiple_responses_in_one_pipe_read(self):
+        server = """import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get('id') == 2:
+        result = {'rateLimits': {'limitId': 'codex'}}
+        responses = [
+            {'id': 1, 'result': {}},
+            {'method': 'notification', 'params': {}},
+            {'id': 2, 'result': result},
+        ]
+        sys.stdout.write(''.join(json.dumps(item) + '\\n' for item in responses))
+        sys.stdout.flush()
+        break
+"""
+        real_popen = subprocess.Popen
+
+        def fake_popen(command, **kwargs):
+            return real_popen([sys.executable, "-c", server], **kwargs)
+
+        with patch.object(module.subprocess, "Popen", side_effect=fake_popen):
+            result = module.fetch_rate_limits(timeout=1)
+        self.assertEqual(result, {"rateLimits": {"limitId": "codex"}})
+
     def test_parse_json_lines_ignores_notifications(self):
         output = "\n".join(
             [
@@ -83,11 +108,12 @@ class UsageModuleTests(unittest.TestCase):
         self.assertEqual(output["class"], ["warning"])
         self.assertEqual(output["percentage"], 72)
 
-    def test_missing_window_is_rejected(self):
+    def test_missing_window_is_rendered_as_unavailable(self):
         result = rate_result()
         result["rateLimits"]["secondary"] = None
-        with self.assertRaises(module.UsageError):
-            module.output_json(result, module.DEFAULT_FORMAT, module.DEFAULT_TOOLTIP, 70, 90)
+        output = module.output_json(result, module.DEFAULT_FORMAT, module.DEFAULT_TOOLTIP, 70, 90)
+        self.assertIn("W n/a%", output["text"])
+        self.assertEqual(output["percentage"], 22)
 
     def test_unknown_template_field_is_rejected(self):
         with self.assertRaises(module.UsageError):
