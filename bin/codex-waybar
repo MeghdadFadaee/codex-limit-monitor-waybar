@@ -24,6 +24,8 @@ DEFAULT_TOOLTIP = (
     "5-hour: {five_hour_used}% used, resets {five_hour_reset_at} ({five_hour_reset_in})\n"
     "Weekly: {weekly_used}% used, resets {weekly_reset_at} ({weekly_reset_in})"
 )
+TERMINAL_BAR_WIDTH = 24
+TERMINAL_WIDTH = 78
 ALLOWED_FIELDS = {
     "five_hour_used",
     "weekly_used",
@@ -257,6 +259,57 @@ def unavailable_json(reason: str) -> dict[str, Any]:
     }
 
 
+def terminal_color(text: str, code: str, color: str) -> str:
+    if color == "never" or (color == "auto" and (not sys.stdout.isatty() or os.environ.get("NO_COLOR"))):
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def terminal_bar(used: int, color: str) -> str:
+    filled = round(max(0, min(100, used)) * TERMINAL_BAR_WIDTH / 100)
+    bar = "█" * filled + "░" * (TERMINAL_BAR_WIDTH - filled)
+    code = "31" if used >= 90 else "33" if used >= 70 else "36"
+    return terminal_color(bar, code, color)
+
+
+def terminal_output(
+    result: dict[str, Any],
+    warning: int,
+    critical: int,
+    color: str,
+    stale: bool = False,
+    stale_reason: str | None = None,
+    now: int | None = None,
+) -> str:
+    snapshot = select_snapshot(result)
+    values, percentage = format_values(snapshot, now or int(time.time()))
+    state = "CRITICAL" if percentage >= critical else "WARNING" if percentage >= warning else "OK"
+    state_code = "31" if state == "CRITICAL" else "33" if state == "WARNING" else "32"
+    def row(label: str, used: int, reset_in: str) -> str:
+        suffix = f"  {used:>3}% used  · resets in {reset_in}"
+        padding = TERMINAL_WIDTH - 36 - len(suffix)
+        return f"│  {label:<7} {terminal_bar(used, color)}{suffix}{' ' * max(0, padding)}│"
+
+    title = f" Codex usage · {values['plan']} "
+    lines = [
+        f"╭{'─' * 2}{title}{'─' * max(2, TERMINAL_WIDTH - 4 - len(title))}╮",
+        row("5-hour", values["five_hour_used"], values["five_hour_reset_in"]),
+        row("Weekly", values["weekly_used"], values["weekly_reset_in"]),
+    ]
+    status_text = state
+    if stale:
+        status_text += f" · cached data ({stale_reason or 'refresh failed'})"
+    status = terminal_color(state, state_code, color) + status_text[len(state) :]
+    status_padding = TERMINAL_WIDTH - 5 - len(status_text)
+    lines.append(f"╰{'─' * 2} {status}{' ' * max(0, status_padding)}╯")
+    return "\n".join(lines)
+
+
+def unavailable_terminal(reason: str, color: str) -> str:
+    label = terminal_color("Codex usage unavailable", "31", color)
+    return f"{label}\n{reason}"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--format", default=DEFAULT_FORMAT, help="Waybar text template")
@@ -266,6 +319,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=10, help="Codex app-server timeout in seconds")
     parser.add_argument("--codex-command", default="codex", help=argparse.SUPPRESS)
     parser.add_argument("--no-cache", action="store_true", help="Disable cached fallback data")
+    parser.add_argument("--mode", choices=("waybar", "terminal"), default="waybar", help="Output mode (default: waybar)")
+    parser.add_argument("--terminal", dest="mode", action="store_const", const="terminal", help="Alias for --mode terminal")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="Terminal color mode (default: auto)")
     return parser.parse_args(argv)
 
 
@@ -277,33 +333,42 @@ def main(argv: list[str] | None = None) -> int:
         if not 0 <= args.warning <= args.critical <= 100:
             raise UsageError("thresholds must satisfy 0 <= warning <= critical <= 100")
     except UsageError as exc:
-        print(json.dumps(unavailable_json(str(exc)), separators=(",", ":")))
+        output = unavailable_terminal(str(exc), args.color) if args.mode == "terminal" else json.dumps(unavailable_json(str(exc)), separators=(",", ":"))
+        print(output)
         return 2
 
     path = cache_path()
     try:
         result = fetch_rate_limits(args.timeout, args.codex_command)
         save_cache(path, result)
-        output = output_json(result, args.format, args.tooltip_format, args.warning, args.critical)
+        output = (
+            terminal_output(result, args.warning, args.critical, args.color)
+            if args.mode == "terminal"
+            else output_json(result, args.format, args.tooltip_format, args.warning, args.critical)
+        )
     except UsageError as exc:
         cached = None if args.no_cache else load_cache(path)
         cached_result = cached.get("result") if isinstance(cached, dict) else None
         try:
             if not isinstance(cached_result, dict):
                 raise UsageError(str(exc))
-            output = output_json(
-                cached_result,
-                args.format,
-                args.tooltip_format,
-                args.warning,
-                args.critical,
-                stale=True,
-                stale_reason=str(exc),
+            output = (
+                terminal_output(cached_result, args.warning, args.critical, args.color, stale=True, stale_reason=str(exc))
+                if args.mode == "terminal"
+                else output_json(
+                    cached_result,
+                    args.format,
+                    args.tooltip_format,
+                    args.warning,
+                    args.critical,
+                    stale=True,
+                    stale_reason=str(exc),
+                )
             )
         except UsageError:
-            output = unavailable_json(str(exc))
+            output = unavailable_terminal(str(exc), args.color) if args.mode == "terminal" else unavailable_json(str(exc))
 
-    print(json.dumps(output, separators=(",", ":")))
+    print(output if args.mode == "terminal" else json.dumps(output, separators=(",", ":")))
     return 0
 
 

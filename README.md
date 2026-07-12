@@ -87,6 +87,17 @@ Other command options:
 --no-cache
 ```
 
+## Terminal mode
+
+For a readable terminal display instead of Waybar JSON, use either command:
+
+```bash
+codex-waybar --terminal
+# or: codex-waybar --mode terminal
+```
+
+It shows both usage windows as color-coded progress bars, reset countdowns, and an overall status. Colors are enabled for interactive terminals; use `--color always` or `--color never` to override that behavior.
+
 ## Styling
 
 The command emits these Waybar CSS classes:

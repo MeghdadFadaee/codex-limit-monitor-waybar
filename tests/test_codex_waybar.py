@@ -122,6 +122,33 @@ class UsageModuleTests(unittest.TestCase):
             self.assertEqual(output["class"], ["unavailable"])
             self.assertIn("offline", output["tooltip"])
 
+    def test_terminal_mode_renders_readable_usage(self):
+        stdout = io.StringIO()
+        with (
+            patch.object(module, "fetch_rate_limits", return_value=rate_result(five_used=72, weekly_used=18)),
+            redirect_stdout(stdout),
+        ):
+            exit_code = module.main(["--terminal", "--color", "never"])
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Codex usage · plus", output)
+        self.assertIn("5-hour", output)
+        self.assertIn("72% used", output)
+        self.assertIn("Weekly", output)
+        self.assertIn("WARNING", output)
+        self.assertNotIn("\033[", output)
+
+    def test_terminal_mode_reports_unavailable_without_json(self):
+        stdout = io.StringIO()
+        with (
+            patch.object(module, "fetch_rate_limits", side_effect=module.UsageError("offline")),
+            patch.object(module, "load_cache", return_value=None),
+            redirect_stdout(stdout),
+        ):
+            module.main(["--mode", "terminal", "--color", "never"])
+        self.assertIn("Codex usage unavailable", stdout.getvalue())
+        self.assertNotIn('{"text"', stdout.getvalue())
+
 
 class ConfigureTests(unittest.TestCase):
     CONFIG = """{
